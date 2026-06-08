@@ -1,97 +1,69 @@
-# goproxy — Project Sketch
+# goproxy Project Sketch
 
-**Stack:** Go · Kubernetes · Terraform  
-**Project:** `goproxy`  
-**Description:** A high-performance reverse proxy and API gateway written in Go.
+This was the initial project plan for `goproxy`.
 
----
+The idea is to build a reverse proxy and API gateway in Go, similar in purpose to the traffic layer handled by tools like Nginx, Caddy, and Traefik. The project is meant to cover routing, load balancing, reliability, observability, deployment, and benchmarking.
 
-## 1. Overview
+## Goals
 
-`goproxy` is a reverse proxy and API gateway built from scratch in Go.
+- Build a reverse proxy from scratch in Go.
+- Learn how traffic is routed between clients and backend services.
+- Add production-style API gateway features one at a time.
+- Deploy the proxy to Kubernetes.
+- Use Terraform for local infrastructure setup.
+- Benchmark the proxy against Nginx once the core features are complete.
 
-It sits in front of backend services and handles:
+## Planned Stack
 
-- Routing
-- Load balancing
-- Rate limiting
-- Circuit breaking
-- Observability
+- Go
+- Kubernetes
+- Terraform
+- Prometheus
+- Nginx for benchmark comparison
 
-This is the same layer that tools like **Nginx**, **Caddy**, and **Traefik** occupy in production systems.
+## Feature Order
 
-### Resume One-Liner
+The features should be built in order so each one is independently testable before the next one is added.
 
-> Built a reverse proxy and API gateway in Go with dynamic routing, load balancing using round-robin and least-connections, per-IP rate limiting, circuit breaking, and Prometheus metrics; deployed on Kubernetes with Terraform and benchmarked against Nginx at 50k req/sec.
+| Feature | Description |
+|---|---|
+| HTTP reverse proxy | Forward requests to upstream servers and stream responses back |
+| Dynamic routing | Route by path prefix, host header, or HTTP method |
+| Round-robin load balancing | Distribute requests evenly across an upstream pool |
+| Least-connections load balancing | Route to the upstream with the fewest active requests |
+| Weighted load balancing | Send different percentages of traffic to different upstreams |
+| Health checks | Periodically check upstream health and avoid unhealthy targets |
+| Rate limiting | Use a token bucket per client IP |
+| Circuit breaker | Stop routing to failing upstreams and support half-open recovery |
+| Prometheus metrics | Track request count, latency, upstream health, and error rate |
+| Config file | Load routes and upstreams from YAML |
+| Hot reload | Reload config on `SIGHUP` without restarting the proxy |
+| Kubernetes deploy | Run the proxy in a local Kubernetes cluster |
+| Terraform deploy | Manage local Kubernetes resources with Terraform |
+| Nginx benchmark | Compare throughput and latency against Nginx |
 
-### Why This Project Fits the Portfolio
-
-- Completes the infrastructure story:
-  - `Golem` = distributed scheduler
-  - `mini-redis` = storage engine
-  - `goproxy` = traffic layer
-- Together, these projects cover multiple layers of a production system.
-- Go is the right language for this project:
-  - Caddy and Traefik are written in Go.
-  - Go fits well for networking, concurrency, and infrastructure tooling.
-- Kubernetes and Terraform deployment makes it resume-ready for infrastructure roles.
-- Benchmarking against Nginx creates a strong performance story with real numbers.
-
----
-
-## 2. Feature Scope
-
-Build the features in strict order. Each feature should be independently useful and testable before moving to the next.
-
-| Feature | Description | Effort |
-|---|---|---:|
-| HTTP reverse proxy | Forward requests to upstream servers and stream responses back | 1 day |
-| Dynamic routing | Route by path prefix, host header, or HTTP method | 1 day |
-| Round-robin load balancing | Distribute requests evenly across upstream pool | 1 day |
-| Least-connections load balancing | Route to upstream with fewest active connections | 1 day |
-| Weighted load balancing | Assign traffic weight per upstream, for example 70/30 split | 0.5 days |
-| Health checks | Periodically ping upstreams and remove unhealthy ones from the pool | 1 day |
-| Rate limiting | Token bucket per client IP with configurable req/sec limit | 1.5 days |
-| Circuit breaker | Stop routing to failing upstreams with half-open recovery | 2 days |
-| Prometheus metrics | Request count, latency histogram, upstream health, and error rate | 1 day |
-| Config file | YAML-based route and upstream config with hot-reload on SIGHUP | 1 day |
-| Kubernetes + Terraform deploy | Deploy to local Kubernetes cluster and provision with Terraform | 2 days |
-| Nginx benchmark | Compare throughput and latency percentiles under load | 1 day |
-
-**Total estimated time:** 3–4 weeks of focused work.
-
----
-
-## 3. Architecture
-
-The proxy is built as a pipeline of middleware handlers.
-
-Each request passes through the pipeline in order. This is the same pattern used by Caddy and Chi: clean, testable, and easy to extend.
+## Planned Architecture
 
 ```text
-Incoming Request
+Incoming request
         |
         v
-┌─────────────────────────────────────────┐
-│              Listener (TCP)             │
-└──────────────────┬──────────────────────┘
-                   |
-        ┌──────────v──────────┐
-        │   Middleware Chain   │
-        │                      │
-        │ 1. Rate Limiter      │
-        │ 2. Router            │
-        │ 3. Circuit Breaker   │
-        │ 4. Load Balancer     │
-        │ 5. Reverse Proxy     │
-        │ 6. Metrics Recorder  │
-        └──────────┬──────────┘
-                   |
-        ┌──────────v──────────┐
-        │    Upstream Pool     │
-        │                      │
-        │ server-1:8081        │
-        │ server-2:8082        │
-        │ server-3:8083        │
-        └─────────────────────┘
+Listener
+        |
+        v
+Middleware chain
+        |
+        |-- Rate limiter
+        |-- Router
+        |-- Circuit breaker
+        |-- Load balancer
+        |-- Reverse proxy
+        |-- Metrics recorder
+        |
+        v
+Upstream pool
 ```
+
+## Notes
+
+The benchmark target is intentionally not listed as a result yet. Throughput and latency numbers should only be added after they are measured with reproducible commands.
