@@ -27,12 +27,11 @@ func New(upstreamURL string) (*Proxy, error) {
 	if upstream.Host == "" {
 		return nil, errors.New("upstream URL must include a host")
 	}
-
-	handler := httputil.NewSingleHostReverseProxy(upstream)
-	originalDirector := handler.Director
-	handler.Director = func(req *http.Request) {
-		originalDirector(req)
-		req.Host = upstream.Host
+	handler := &httputil.ReverseProxy{
+		Rewrite: func(preq *httputil.ProxyRequest) {
+			preq.SetURL(upstream)
+			preq.Out.Host = upstream.Host
+		},
 	}
 
 	handler.ErrorHandler = func(w http.ResponseWriter, _ *http.Request, _ error) {
