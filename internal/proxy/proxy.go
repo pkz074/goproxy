@@ -51,5 +51,6 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Upstream returns the configured upstream URL.
 func (p *Proxy) Upstream() *url.URL {
-	return p.upstream
+	upstream := *p.upstream
+	return &upstream
 }

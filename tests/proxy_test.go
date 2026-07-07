@@ -135,3 +135,17 @@ func TestProxyReturnsBadGatewayWhenUpstreamIsUnavailable(t *testing.T) {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusBadGateway)
 	}
 }
+
+func TestProxyUpstreamReturnsCopy(t *testing.T) {
+	handler, err := proxy.New("http://upstream.local:8080")
+	if err != nil {
+		t.Fatalf("create proxy: %v", err)
+	}
+
+	returned := handler.Upstream()
+	returned.Host = "changed.local:9090"
+
+	if got := handler.Upstream().Host; got != "upstream.local:8080" {
+		t.Fatalf("upstream host = %q, want %q", got, "upstream.local:8080")
+	}
+}

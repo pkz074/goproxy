@@ -9,7 +9,7 @@ import (
 	"github.com/pkz074/goproxy/internal/proxy"
 )
 
-func MatchesByPathPrefix(t *testing.T) {
+func TestMatchesByPathPrefix(t *testing.T) {
 	routes := []proxy.Route{
 		{PathPrefix: "/api", UpstreamURL: "http://api-service"},
 	}
@@ -26,7 +26,7 @@ func MatchesByPathPrefix(t *testing.T) {
 	}
 }
 
-func NotMatchWrongPath(t *testing.T) {
+func TestNotMatchWrongPath(t *testing.T) {
 	routes := []proxy.Route{
 		{PathPrefix: "/api", UpstreamURL: "http://api-service"},
 	}
@@ -38,7 +38,7 @@ func NotMatchWrongPath(t *testing.T) {
 	}
 }
 
-func EmptyHostMatchesAnyHost(t *testing.T) {
+func TestEmptyHostMatchesAnyHost(t *testing.T) {
 	routes := []proxy.Route{
 		{Host: "", PathPrefix: "/api", UpstreamURL: "http://api-service"},
 	}
@@ -53,7 +53,7 @@ func EmptyHostMatchesAnyHost(t *testing.T) {
 	}
 }
 
-func RequiresHostWhenConfigured(t *testing.T) {
+func TestRequiresHostWhenConfigured(t *testing.T) {
 	routes := []proxy.Route{
 		{Host: "admin.local", PathPrefix: "/", UpstreamURL: "http://admin-service"},
 	}
@@ -65,7 +65,7 @@ func RequiresHostWhenConfigured(t *testing.T) {
 	}
 }
 
-func EmptyMethodMatchesAnyMethod(t *testing.T) {
+func TestEmptyMethodMatchesAnyMethod(t *testing.T) {
 	routes := []proxy.Route{
 		{Method: "", PathPrefix: "/orders", UpstreamURL: "http://orders-service"},
 	}
@@ -82,7 +82,7 @@ func EmptyMethodMatchesAnyMethod(t *testing.T) {
 	}
 }
 
-func RequiresMethodWhenConfigured(t *testing.T) {
+func TestRequiresMethodWhenConfigured(t *testing.T) {
 	routes := []proxy.Route{
 		{Method: http.MethodPost, PathPrefix: "/orders", UpstreamURL: "http://orders-service"},
 	}
@@ -95,7 +95,7 @@ func RequiresMethodWhenConfigured(t *testing.T) {
 	}
 }
 
-func RouteLongestPathPrefixWins(t *testing.T) {
+func TestRouteLongestPathPrefixWins(t *testing.T) {
 	routes := []proxy.Route{
 		{PathPrefix: "/api", UpstreamURL: "http://api-service"},
 		{PathPrefix: "/api/users", UpstreamURL: "http://users-service"},
@@ -113,7 +113,7 @@ func RouteLongestPathPrefixWins(t *testing.T) {
 	}
 }
 
-func ReturnsFalseWhenNoRouteMatches(t *testing.T) {
+func TestReturnsFalseWhenNoRouteMatches(t *testing.T) {
 	routes := []proxy.Route{
 		{Host: "admin.local", Method: http.MethodPost, PathPrefix: "/admin", UpstreamURL: "http://admin-service"},
 	}
@@ -126,7 +126,7 @@ func ReturnsFalseWhenNoRouteMatches(t *testing.T) {
 	}
 }
 
-func ProxyForwardsToMatchedUpstream(t *testing.T) {
+func TestProxyForwardsToMatchedUpstream(t *testing.T) {
 	users := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("users"))
 	}))
@@ -167,7 +167,7 @@ func ProxyForwardsToMatchedUpstream(t *testing.T) {
 	}
 }
 
-func NotFoundWhenNoRouteMatches(t *testing.T) {
+func TestNotFoundWhenNoRouteMatches(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("upstream"))
 	}))
@@ -187,5 +187,35 @@ func NotFoundWhenNoRouteMatches(t *testing.T) {
 
 	if response.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
+func TestNewRoutedCopiesRouteSlice(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("original"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	routes := []proxy.Route{
+		{PathPrefix: "/api", UpstreamURL: upstream.URL},
+	}
+
+	handler, err := proxy.NewRouted(routes)
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	routes[0].PathPrefix = "/changed"
+
+	request := httptest.NewRequest(http.MethodGet, "http://proxy.local/api/users", http.NoBody)
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusOK)
+	}
+
+	if body := response.Body.String(); body != "original" {
+		t.Fatalf("body = %q, want %q", body, "original")
 	}
 }

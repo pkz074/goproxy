@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"fmt"
 	"net/http"
 	"strings"
 )
@@ -18,23 +19,24 @@ type RoutedProxy struct {
 }
 
 func NewRouted(routes []Route) (*RoutedProxy, error) {
+	routeCopy := append([]Route(nil), routes...)
 	proxies := make(map[string]*Proxy)
 
-	for _, route := range routes {
+	for _, route := range routeCopy {
 		if _, ok := proxies[route.UpstreamURL]; ok {
 			continue
 		}
 
 		proxy, err := New(route.UpstreamURL)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("create proxy for route %q: %w", route.PathPrefix, err)
 		}
 
 		proxies[route.UpstreamURL] = proxy
 	}
 
 	return &RoutedProxy{
-		routes:  routes,
+		routes:  routeCopy,
 		proxies: proxies,
 	}, nil
 }
