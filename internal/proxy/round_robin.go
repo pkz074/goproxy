@@ -15,6 +15,15 @@ func NewRoundRobin(upstreams []Upstream) (*RoundRobin, error) {
 		return nil, ErrNoUpstreams
 	}
 
+	seen := make(map[string]struct{}, len(upstreams))
+	for _, upstream := range upstreams {
+		if _, ok := seen[upstream.URL]; ok {
+			return nil, ErrDuplicateUpstream
+		}
+
+		seen[upstream.URL] = struct{}{}
+	}
+
 	upstreamCopy := append([]Upstream(nil), upstreams...)
 
 	return &RoundRobin{

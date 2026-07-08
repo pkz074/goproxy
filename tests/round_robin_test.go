@@ -71,6 +71,21 @@ func TestRoundRobinCopiesUpstreamSlice(t *testing.T) {
 	}
 }
 
+func TestNewRoundRobinRejectsDuplicateUpstream(t *testing.T) {
+	balancer, err := proxy.NewRoundRobin([]proxy.Upstream{
+		{URL: "http://upstream-a"},
+		{URL: "http://upstream-a"},
+	})
+
+	if !errors.Is(err, proxy.ErrDuplicateUpstream) {
+		t.Fatalf("error = %v, want %v", err, proxy.ErrDuplicateUpstream)
+	}
+
+	if balancer != nil {
+		t.Fatalf("balancer = %#v, want nil", balancer)
+	}
+}
+
 func TestRoundRobinConcurrentCalls(t *testing.T) {
 	balancer, err := proxy.NewRoundRobin([]proxy.Upstream{
 		{URL: "http://upstream-a"},

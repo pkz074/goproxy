@@ -1,9 +1,11 @@
 package tests
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/pkz074/goproxy/internal/proxy"
@@ -218,4 +220,284 @@ func TestNewRoutedCopiesRouteSlice(t *testing.T) {
 	if body := response.Body.String(); body != "original" {
 		t.Fatalf("body = %q, want %q", body, "original")
 	}
+}
+
+func TestRoutedProxyRoundRobinLoadBalancesUpstreamPool(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("first"))
+	}))
+	t.Cleanup(first.Close)
+
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("second"))
+	}))
+	t.Cleanup(second.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix: "/api",
+			Strategy:   proxy.StrategyRoundRobin,
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: first.URL}},
+				{Upstream: proxy.Upstream{URL: second.URL}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	want := []string{"first", "second", "first", "second"}
+	for i, wantBody := range want {
+		body := serveRoutedRequest(t, handler, "/api/users")
+		if body != wantBody {
+			t.Fatalf("request %d body = %q, want %q", i+1, body, wantBody)
+		}
+	}
+}
+
+func TestRoutedProxyWeightedRoundRobinLoadBalancesUpstreamPool(t *testing.T) {
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("first"))
+	}))
+	t.Cleanup(first.Close)
+
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("second"))
+	}))
+	t.Cleanup(second.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix: "/api",
+			Strategy:   proxy.StrategyWeightedRoundRobin,
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: first.URL}, Weight: 3},
+				{Upstream: proxy.Upstream{URL: second.URL}, Weight: 1},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	want := []string{"first", "first", "second", "first"}
+	for i, wantBody := range want {
+		body := serveRoutedRequest(t, handler, "/api/users")
+		if body != wantBody {
+			t.Fatalf("request %d body = %q, want %q", i+1, body, wantBody)
+		}
+	}
+}
+
+func TestRoutedProxyLeastConnectionsReleasesAfterRequest(t *testing.T) {
+	firstStarted := make(chan struct{})
+	firstCanFinish := make(chan struct{})
+	var once sync.Once
+
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		once.Do(func() {
+			close(firstStarted)
+		})
+		<-firstCanFinish
+		_, _ = w.Write([]byte("first"))
+	}))
+	t.Cleanup(first.Close)
+
+	second := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("second"))
+	}))
+	t.Cleanup(second.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix: "/api",
+			Strategy:   proxy.StrategyLeastConnections,
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: first.URL}},
+				{Upstream: proxy.Upstream{URL: second.URL}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	firstDone := make(chan string, 1)
+	firstErr := make(chan error, 1)
+	go func() {
+		status, body, err := routedResponse(handler, "/api/users")
+		if err != nil {
+			firstErr <- err
+			return
+		}
+
+		if status != http.StatusOK {
+			firstErr <- errors.New("first request returned non-OK status")
+			return
+		}
+
+		firstDone <- body
+		firstErr <- nil
+	}()
+
+	<-firstStarted
+
+	if body := serveRoutedRequest(t, handler, "/api/users"); body != "second" {
+		t.Fatalf("overlapping request body = %q, want second", body)
+	}
+
+	close(firstCanFinish)
+
+	if err := <-firstErr; err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	if body := <-firstDone; body != "first" {
+		t.Fatalf("first request body = %q, want first", body)
+	}
+
+	if body := serveRoutedRequest(t, handler, "/api/users"); body != "first" {
+		t.Fatalf("post-release request body = %q, want first", body)
+	}
+}
+
+func TestNewRoutedRejectsRouteWithoutUpstream(t *testing.T) {
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{PathPrefix: "/api"},
+	})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !errors.Is(err, proxy.ErrInvalidRoute) {
+		t.Fatalf("error = %v, want %v", err, proxy.ErrInvalidRoute)
+	}
+
+	if handler != nil {
+		t.Fatalf("handler = %#v, want nil", handler)
+	}
+}
+
+func TestNewRoutedRejectsRouteWithSingleUpstreamAndPool(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstream.URL,
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: upstream.URL}},
+			},
+		},
+	})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !errors.Is(err, proxy.ErrInvalidRoute) {
+		t.Fatalf("error = %v, want %v", err, proxy.ErrInvalidRoute)
+	}
+
+	if handler != nil {
+		t.Fatalf("handler = %#v, want nil", handler)
+	}
+}
+
+func TestNewRoutedRejectsUnknownStrategy(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix: "/api",
+			Strategy:   proxy.BalancingStrategy("unknown"),
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: upstream.URL}},
+			},
+		},
+	})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !errors.Is(err, proxy.ErrUnknownStrategy) {
+		t.Fatalf("error = %v, want %v", err, proxy.ErrUnknownStrategy)
+	}
+
+	if handler != nil {
+		t.Fatalf("handler = %#v, want nil", handler)
+	}
+}
+
+func TestNewRoutedCopiesUpstreamPool(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("original"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	changed := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("changed"))
+	}))
+	t.Cleanup(changed.Close)
+
+	routes := []proxy.Route{
+		{
+			PathPrefix: "/api",
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: upstream.URL}},
+			},
+		},
+	}
+
+	handler, err := proxy.NewRouted(routes)
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	routes[0].Upstreams[0].Upstream.URL = changed.URL
+
+	if body := serveRoutedRequest(t, handler, "/api/users"); body != "original" {
+		t.Fatalf("body = %q, want original", body)
+	}
+}
+
+func serveRoutedRequest(t *testing.T, handler http.Handler, path string) string {
+	t.Helper()
+
+	status, body, err := routedResponse(handler, path)
+	if err != nil {
+		t.Fatalf("request routed proxy: %v", err)
+	}
+
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+
+	return body
+}
+
+func routedResponse(handler http.Handler, path string) (int, string, error) {
+	request := httptest.NewRequest(http.MethodGet, "http://proxy.local"+path, http.NoBody)
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	result := response.Result()
+	defer result.Body.Close()
+
+	body, err := io.ReadAll(result.Body)
+	if err != nil {
+		return 0, "", err
+	}
+
+	return result.StatusCode, string(body), nil
 }
