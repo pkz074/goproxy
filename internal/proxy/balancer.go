@@ -21,6 +21,7 @@ var (
 	ErrInvalidWeight     = errors.New("upstream weight cannot be negative")
 	ErrInvalidRoute      = errors.New("route must define exactly one upstream source")
 	ErrUnknownStrategy   = errors.New("unknown load balancing strategy")
+	ErrContextRequired   = errors.New("health checks require NewRoutedWithContext")
 )
 
 type routeBalancer interface {

@@ -1,12 +1,14 @@
 package tests
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/pkz074/goproxy/internal/proxy"
 )
@@ -438,6 +440,56 @@ func TestNewRoutedRejectsUnknownStrategy(t *testing.T) {
 	}
 }
 
+func TestNewRoutedRejectsHealthChecksWithoutContext(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstream.URL,
+			HealthCheck: proxy.HealthCheckConfig{
+				Enabled: true,
+			},
+		},
+	})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !errors.Is(err, proxy.ErrContextRequired) {
+		t.Fatalf("error = %v, want %v", err, proxy.ErrContextRequired)
+	}
+
+	if handler != nil {
+		t.Fatalf("handler = %#v, want nil", handler)
+	}
+}
+
+func TestNewRoutedWithContextRejectsNilContext(t *testing.T) {
+	handler, err := proxy.NewRoutedWithContext(nil, []proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: "http://upstream.local",
+		},
+	})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !errors.Is(err, proxy.ErrContextRequired) {
+		t.Fatalf("error = %v, want %v", err, proxy.ErrContextRequired)
+	}
+
+	if handler != nil {
+		t.Fatalf("handler = %#v, want nil", handler)
+	}
+}
+
 func TestNewRoutedCopiesUpstreamPool(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("original"))
@@ -470,6 +522,94 @@ func TestNewRoutedCopiesUpstreamPool(t *testing.T) {
 	}
 }
 
+func TestRoutedProxySkipsUnhealthyUpstreams(t *testing.T) {
+	unhealthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		_, _ = w.Write([]byte("unhealthy"))
+	}))
+	t.Cleanup(unhealthy.Close)
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+
+		_, _ = w.Write([]byte("healthy"))
+	}))
+	t.Cleanup(healthy.Close)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	handler, err := proxy.NewRoutedWithContext(ctx, []proxy.Route{
+		{
+			PathPrefix: "/api",
+			Strategy:   proxy.StrategyRoundRobin,
+			HealthCheck: proxy.HealthCheckConfig{
+				Enabled:  true,
+				Path:     "/healthz",
+				Interval: time.Millisecond,
+				Timeout:  100 * time.Millisecond,
+			},
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: unhealthy.URL}},
+				{Upstream: proxy.Upstream{URL: healthy.URL}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	eventually(t, time.Second, func() bool {
+		return serveRoutedRequest(t, handler, "/api/users") == "healthy"
+	})
+
+	for i := 0; i < 4; i++ {
+		if body := serveRoutedRequest(t, handler, "/api/users"); body != "healthy" {
+			t.Fatalf("request %d body = %q, want healthy", i+1, body)
+		}
+	}
+}
+
+func TestRoutedProxyReturnsUnavailableWhenAllUpstreamsAreUnhealthy(t *testing.T) {
+	first := newUnhealthyServer(t)
+	second := newUnhealthyServer(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	handler, err := proxy.NewRoutedWithContext(ctx, []proxy.Route{
+		{
+			PathPrefix: "/api",
+			Strategy:   proxy.StrategyRoundRobin,
+			HealthCheck: proxy.HealthCheckConfig{
+				Enabled:  true,
+				Path:     "/healthz",
+				Interval: time.Millisecond,
+				Timeout:  100 * time.Millisecond,
+			},
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: first.URL}},
+				{Upstream: proxy.Upstream{URL: second.URL}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	eventually(t, time.Second, func() bool {
+		status, _, err := routedResponse(handler, "/api/users")
+		return err == nil && status == http.StatusServiceUnavailable
+	})
+}
+
 func serveRoutedRequest(t *testing.T, handler http.Handler, path string) string {
 	t.Helper()
 
@@ -500,4 +640,35 @@ func routedResponse(handler http.Handler, path string) (int, string, error) {
 	}
 
 	return result.StatusCode, string(body), nil
+}
+
+func newUnhealthyServer(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/healthz" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		_, _ = w.Write([]byte("unhealthy"))
+	}))
+	t.Cleanup(server.Close)
+
+	return server
+}
+
+func eventually(t *testing.T, timeout time.Duration, check func() bool) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if check() {
+			return
+		}
+
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Fatal("condition was not met before timeout")
 }

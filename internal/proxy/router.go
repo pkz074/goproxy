@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ type Route struct {
 	UpstreamURL string
 	Upstreams   []WeightedUpstream
 	Strategy    BalancingStrategy
+	HealthCheck HealthCheckConfig
 }
 
 type RoutedProxy struct {
@@ -23,9 +25,29 @@ type RoutedProxy struct {
 type routeRuntime struct {
 	route    Route
 	balancer routeBalancer
+	health   *HealthTable
+	attempts int
 }
 
 func NewRouted(routes []Route) (*RoutedProxy, error) {
+	for _, route := range routes {
+		if route.HealthCheck.Enabled {
+			return nil, ErrContextRequired
+		}
+	}
+
+	return newRouted(context.Background(), routes)
+}
+
+func NewRoutedWithContext(ctx context.Context, routes []Route) (*RoutedProxy, error) {
+	if ctx == nil {
+		return nil, ErrContextRequired
+	}
+
+	return newRouted(ctx, routes)
+}
+
+func newRouted(ctx context.Context, routes []Route) (*RoutedProxy, error) {
 	routeCopy := copyRoutes(routes)
 	runtimes := make([]routeRuntime, 0, len(routeCopy))
 	proxies := make(map[string]*Proxy)
@@ -39,6 +61,13 @@ func NewRouted(routes []Route) (*RoutedProxy, error) {
 		balancer, err := newRouteBalancer(route, upstreams)
 		if err != nil {
 			return nil, fmt.Errorf("route %q: %w", route.PathPrefix, err)
+		}
+
+		plain := plainUpstreams(upstreams)
+		health := NewHealthTable(plain)
+		if route.HealthCheck.Enabled {
+			checker := NewHealthChecker(plain, route.HealthCheck, health)
+			go checker.Run(ctx)
 		}
 
 		for _, upstream := range upstreams {
@@ -57,6 +86,8 @@ func NewRouted(routes []Route) (*RoutedProxy, error) {
 		runtimes = append(runtimes, routeRuntime{
 			route:    route,
 			balancer: balancer,
+			health:   health,
+			attempts: len(upstreams),
 		})
 	}
 
@@ -103,7 +134,7 @@ func (p *RoutedProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, release, err := runtime.balancer.Acquire()
+	upstream, release, err := runtime.acquireHealthy()
 	if err != nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
@@ -117,6 +148,23 @@ func (p *RoutedProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	upstreamProxy.ServeHTTP(w, r)
+}
+
+func (r *routeRuntime) acquireHealthy() (Upstream, func(), error) {
+	for range r.attempts {
+		upstream, release, err := r.balancer.Acquire()
+		if err != nil {
+			return Upstream{}, func() {}, err
+		}
+
+		if r.health.IsHealthy(upstream) {
+			return upstream, release, nil
+		}
+
+		release()
+	}
+
+	return Upstream{}, func() {}, ErrNoUpstreams
 }
 
 func (p *RoutedProxy) matchRoute(r *http.Request) (*routeRuntime, bool) {
@@ -185,24 +233,14 @@ func newRouteBalancer(route Route, upstreams []WeightedUpstream) (routeBalancer,
 
 	switch strategy {
 	case StrategyRoundRobin:
-		plain := make([]Upstream, len(upstreams))
-		for i, upstream := range upstreams {
-			plain[i] = upstream.Upstream
-		}
-
-		balancer, err := NewRoundRobin(plain)
+		balancer, err := NewRoundRobin(plainUpstreams(upstreams))
 		if err != nil {
 			return nil, err
 		}
 
 		return &roundRobinRouteBalancer{balancer: balancer}, nil
 	case StrategyLeastConnections:
-		plain := make([]Upstream, len(upstreams))
-		for i, upstream := range upstreams {
-			plain[i] = upstream.Upstream
-		}
-
-		balancer, err := NewLeastConnections(plain)
+		balancer, err := NewLeastConnections(plainUpstreams(upstreams))
 		if err != nil {
 			return nil, err
 		}
@@ -218,4 +256,13 @@ func newRouteBalancer(route Route, upstreams []WeightedUpstream) (routeBalancer,
 	default:
 		return nil, ErrUnknownStrategy
 	}
+}
+
+func plainUpstreams(upstreams []WeightedUpstream) []Upstream {
+	plain := make([]Upstream, len(upstreams))
+	for i, upstream := range upstreams {
+		plain[i] = upstream.Upstream
+	}
+
+	return plain
 }
