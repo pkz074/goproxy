@@ -8,13 +8,15 @@ import (
 )
 
 type Route struct {
-	Host        string
-	Method      string
-	PathPrefix  string
-	UpstreamURL string
-	Upstreams   []WeightedUpstream
-	Strategy    BalancingStrategy
-	HealthCheck HealthCheckConfig
+	Host           string
+	Method         string
+	PathPrefix     string
+	UpstreamURL    string
+	Upstreams      []WeightedUpstream
+	Strategy       BalancingStrategy
+	HealthCheck    HealthCheckConfig
+	RateLimit      RateLimitConfig
+	CircuitBreaker CircuitBreakerConfig
 }
 
 type RoutedProxy struct {
@@ -26,6 +28,8 @@ type routeRuntime struct {
 	route    Route
 	balancer routeBalancer
 	health   *HealthTable
+	limiter  *RateLimiter
+	breakers map[string]*CircuitBreaker
 	attempts int
 }
 
@@ -51,6 +55,7 @@ func newRouted(ctx context.Context, routes []Route) (*RoutedProxy, error) {
 	routeCopy := copyRoutes(routes)
 	runtimes := make([]routeRuntime, 0, len(routeCopy))
 	proxies := make(map[string]*Proxy)
+	checkers := make([]*HealthChecker, 0, len(routeCopy))
 
 	for _, route := range routeCopy {
 		upstreams, err := routeUpstreams(route)
@@ -67,7 +72,27 @@ func newRouted(ctx context.Context, routes []Route) (*RoutedProxy, error) {
 		health := NewHealthTable(plain)
 		if route.HealthCheck.Enabled {
 			checker := NewHealthChecker(plain, route.HealthCheck, health)
-			go checker.Run(ctx)
+			checkers = append(checkers, checker)
+		}
+
+		var limiter *RateLimiter
+		if route.RateLimit.Enabled {
+			limiter, err = NewRateLimiter(route.RateLimit)
+			if err != nil {
+				return nil, fmt.Errorf("route %q: %w", route.PathPrefix, err)
+			}
+		}
+
+		breakers := make(map[string]*CircuitBreaker, len(plain))
+		if route.CircuitBreaker.Enabled {
+			for _, upstream := range plain {
+				breaker, err := NewCircuitBreaker(route.CircuitBreaker)
+				if err != nil {
+					return nil, fmt.Errorf("route %q: %w", route.PathPrefix, err)
+				}
+
+				breakers[upstream.URL] = breaker
+			}
 		}
 
 		for _, upstream := range upstreams {
@@ -87,8 +112,14 @@ func newRouted(ctx context.Context, routes []Route) (*RoutedProxy, error) {
 			route:    route,
 			balancer: balancer,
 			health:   health,
+			limiter:  limiter,
+			breakers: breakers,
 			attempts: len(upstreams),
 		})
+	}
+
+	for _, checker := range checkers {
+		go checker.Run(ctx)
 	}
 
 	return &RoutedProxy{
@@ -134,7 +165,12 @@ func (p *RoutedProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstream, release, err := runtime.acquireHealthy()
+	if runtime.limiter != nil && !runtime.limiter.Allow(r) {
+		http.Error(w, "too many requests", http.StatusTooManyRequests)
+		return
+	}
+
+	upstream, release, err := runtime.acquireAvailable()
 	if err != nil {
 		http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 		return
@@ -147,17 +183,24 @@ func (p *RoutedProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	upstreamProxy.ServeHTTP(w, r)
+	recorder := &statusRecorder{
+		ResponseWriter: w,
+		status:         http.StatusOK,
+	}
+
+	upstreamProxy.ServeHTTP(recorder, r)
+	runtime.recordResult(upstream, recorder.status)
 }
 
-func (r *routeRuntime) acquireHealthy() (Upstream, func(), error) {
+func (r *routeRuntime) acquireAvailable() (Upstream, func(), error) {
 	for range r.attempts {
 		upstream, release, err := r.balancer.Acquire()
 		if err != nil {
 			return Upstream{}, func() {}, err
 		}
 
-		if r.health.IsHealthy(upstream) {
+		breaker := r.breakers[upstream.URL]
+		if r.health.IsHealthy(upstream) && (breaker == nil || breaker.Allow()) {
 			return upstream, release, nil
 		}
 
@@ -165,6 +208,53 @@ func (r *routeRuntime) acquireHealthy() (Upstream, func(), error) {
 	}
 
 	return Upstream{}, func() {}, ErrNoUpstreams
+}
+
+func (r *routeRuntime) recordResult(upstream Upstream, status int) {
+	breaker := r.breakers[upstream.URL]
+	if breaker == nil {
+		return
+	}
+
+	if status >= http.StatusInternalServerError {
+		breaker.RecordFailure()
+		return
+	}
+
+	breaker.RecordSuccess()
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (s *statusRecorder) WriteHeader(status int) {
+	if s.wroteHeader {
+		return
+	}
+
+	s.wroteHeader = true
+	s.status = status
+	s.ResponseWriter.WriteHeader(status)
+}
+
+func (s *statusRecorder) Unwrap() http.ResponseWriter {
+	return s.ResponseWriter
+}
+
+func (s *statusRecorder) Flush() {
+	flusher, ok := s.ResponseWriter.(http.Flusher)
+	if !ok {
+		return
+	}
+
+	if !s.wroteHeader {
+		s.WriteHeader(http.StatusOK)
+	}
+
+	flusher.Flush()
 }
 
 func (p *RoutedProxy) matchRoute(r *http.Request) (*routeRuntime, bool) {

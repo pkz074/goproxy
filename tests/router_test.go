@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -608,6 +609,384 @@ func TestRoutedProxyReturnsUnavailableWhenAllUpstreamsAreUnhealthy(t *testing.T)
 		status, _, err := routedResponse(handler, "/api/users")
 		return err == nil && status == http.StatusServiceUnavailable
 	})
+}
+
+func TestRoutedProxyRateLimitsMatchedRoute(t *testing.T) {
+	requests := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstream.URL,
+			RateLimit: proxy.RateLimitConfig{
+				Enabled:           true,
+				RequestsPerSecond: 1,
+				Burst:             1,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	first := httptest.NewRequest(http.MethodGet, "http://proxy.local/api/users", http.NoBody)
+	first.RemoteAddr = "192.0.2.10:1234"
+	firstResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstResponse, first)
+
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("first status = %d, want %d", firstResponse.Code, http.StatusOK)
+	}
+
+	second := httptest.NewRequest(http.MethodGet, "http://proxy.local/api/users", http.NoBody)
+	second.RemoteAddr = "192.0.2.10:5678"
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, second)
+
+	if secondResponse.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want %d", secondResponse.Code, http.StatusTooManyRequests)
+	}
+
+	if requests != 1 {
+		t.Fatalf("upstream requests = %d, want 1", requests)
+	}
+}
+
+func TestNewRoutedRejectsInvalidRateLimit(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstream.URL,
+			RateLimit: proxy.RateLimitConfig{
+				Enabled:           true,
+				RequestsPerSecond: 0,
+				Burst:             1,
+			},
+		},
+	})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !errors.Is(err, proxy.ErrInvalidRate) {
+		t.Fatalf("error = %v, want %v", err, proxy.ErrInvalidRate)
+	}
+
+	if handler != nil {
+		t.Fatalf("handler = %#v, want nil", handler)
+	}
+}
+
+func TestRoutedProxyCircuitBreakerSkipsOpenUpstream(t *testing.T) {
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte("failing"))
+	}))
+	t.Cleanup(failing.Close)
+
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("healthy"))
+	}))
+	t.Cleanup(healthy.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix: "/api",
+			Strategy:   proxy.StrategyRoundRobin,
+			CircuitBreaker: proxy.CircuitBreakerConfig{
+				Enabled:          true,
+				FailureThreshold: 1,
+				RecoveryTimeout:  time.Minute,
+			},
+			Upstreams: []proxy.WeightedUpstream{
+				{Upstream: proxy.Upstream{URL: failing.URL}},
+				{Upstream: proxy.Upstream{URL: healthy.URL}},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	status, _, err := routedResponse(handler, "/api/users")
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	if status != http.StatusInternalServerError {
+		t.Fatalf("first status = %d, want %d", status, http.StatusInternalServerError)
+	}
+
+	if body := serveRoutedRequest(t, handler, "/api/users"); body != "healthy" {
+		t.Fatalf("second body = %q, want healthy", body)
+	}
+
+	if body := serveRoutedRequest(t, handler, "/api/users"); body != "healthy" {
+		t.Fatalf("third body = %q, want healthy", body)
+	}
+}
+
+func TestRoutedProxyCircuitBreakerCountsTransportFailure(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	upstreamURL := upstream.URL
+	upstream.Close()
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstreamURL,
+			CircuitBreaker: proxy.CircuitBreakerConfig{
+				Enabled:          true,
+				FailureThreshold: 1,
+				RecoveryTimeout:  time.Minute,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	status, _, err := routedResponse(handler, "/api/users")
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	if status != http.StatusBadGateway {
+		t.Fatalf("first status = %d, want %d", status, http.StatusBadGateway)
+	}
+
+	status, _, err = routedResponse(handler, "/api/users")
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+}
+
+func TestRoutedProxyCircuitBreakerHalfOpenRecovery(t *testing.T) {
+	var healthy atomic.Bool
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if !healthy.Load() {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		_, _ = w.Write([]byte("recovered"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstream.URL,
+			CircuitBreaker: proxy.CircuitBreakerConfig{
+				Enabled:          true,
+				FailureThreshold: 1,
+				RecoveryTimeout:  10 * time.Millisecond,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	status, _, err := routedResponse(handler, "/api/users")
+	if err != nil {
+		t.Fatalf("first request: %v", err)
+	}
+
+	if status != http.StatusInternalServerError {
+		t.Fatalf("first status = %d, want %d", status, http.StatusInternalServerError)
+	}
+
+	status, _, err = routedResponse(handler, "/api/users")
+	if err != nil {
+		t.Fatalf("second request: %v", err)
+	}
+
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("second status = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+
+	healthy.Store(true)
+	time.Sleep(20 * time.Millisecond)
+
+	if body := serveRoutedRequest(t, handler, "/api/users"); body != "recovered" {
+		t.Fatalf("third body = %q, want recovered", body)
+	}
+
+	if body := serveRoutedRequest(t, handler, "/api/users"); body != "recovered" {
+		t.Fatalf("fourth body = %q, want recovered", body)
+	}
+}
+
+func TestRoutedProxyCircuitBreakerIgnoresLateSuccess(t *testing.T) {
+	started := make(chan struct{}, 2)
+	failed := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		if r.URL.Path == "/api/fail" {
+			w.WriteHeader(http.StatusInternalServerError)
+			close(failed)
+			return
+		}
+
+		<-failed
+		_, _ = w.Write([]byte("late success"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstream.URL,
+			CircuitBreaker: proxy.CircuitBreakerConfig{
+				Enabled:          true,
+				FailureThreshold: 1,
+				RecoveryTimeout:  time.Minute,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	failedResponse := make(chan int, 1)
+	go func() {
+		status, _, requestErr := routedResponse(handler, "/api/fail")
+		if requestErr != nil {
+			failedResponse <- 0
+			return
+		}
+		failedResponse <- status
+	}()
+
+	lateResponse := make(chan int, 1)
+	go func() {
+		status, _, requestErr := routedResponse(handler, "/api/late")
+		if requestErr != nil {
+			lateResponse <- 0
+			return
+		}
+		lateResponse <- status
+	}()
+
+	for range 2 {
+		<-started
+	}
+
+	if status := <-failedResponse; status != http.StatusInternalServerError {
+		t.Fatalf("failed status = %d, want %d", status, http.StatusInternalServerError)
+	}
+
+	if status := <-lateResponse; status != http.StatusOK {
+		t.Fatalf("late status = %d, want %d", status, http.StatusOK)
+	}
+
+	status, _, err := routedResponse(handler, "/api/after")
+	if err != nil {
+		t.Fatalf("request after breaker opened: %v", err)
+	}
+
+	if status != http.StatusServiceUnavailable {
+		t.Fatalf("status after breaker opened = %d, want %d", status, http.StatusServiceUnavailable)
+	}
+}
+
+func TestRoutedProxyRateLimitRunsBeforeCircuitBreaker(t *testing.T) {
+	var requests atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstream.URL,
+			RateLimit: proxy.RateLimitConfig{
+				Enabled:           true,
+				RequestsPerSecond: 1,
+				Burst:             1,
+			},
+			CircuitBreaker: proxy.CircuitBreakerConfig{
+				Enabled:          true,
+				FailureThreshold: 1,
+				RecoveryTimeout:  time.Minute,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("create routed proxy: %v", err)
+	}
+
+	first := httptest.NewRequest(http.MethodGet, "http://proxy.local/api", http.NoBody)
+	first.RemoteAddr = "192.0.2.20:1234"
+	firstResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstResponse, first)
+	if firstResponse.Code != http.StatusInternalServerError {
+		t.Fatalf("first status = %d, want %d", firstResponse.Code, http.StatusInternalServerError)
+	}
+
+	second := httptest.NewRequest(http.MethodGet, "http://proxy.local/api", http.NoBody)
+	second.RemoteAddr = "192.0.2.20:5678"
+	secondResponse := httptest.NewRecorder()
+	handler.ServeHTTP(secondResponse, second)
+	if secondResponse.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status = %d, want %d", secondResponse.Code, http.StatusTooManyRequests)
+	}
+
+	if requests.Load() != 1 {
+		t.Fatalf("upstream requests = %d, want 1", requests.Load())
+	}
+}
+
+func TestNewRoutedRejectsInvalidCircuitBreaker(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("upstream"))
+	}))
+	t.Cleanup(upstream.Close)
+
+	handler, err := proxy.NewRouted([]proxy.Route{
+		{
+			PathPrefix:  "/api",
+			UpstreamURL: upstream.URL,
+			CircuitBreaker: proxy.CircuitBreakerConfig{
+				Enabled:          true,
+				FailureThreshold: 0,
+				RecoveryTimeout:  time.Second,
+			},
+		},
+	})
+
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	if !errors.Is(err, proxy.ErrInvalidFailureThreshold) {
+		t.Fatalf("error = %v, want %v", err, proxy.ErrInvalidFailureThreshold)
+	}
+
+	if handler != nil {
+		t.Fatalf("handler = %#v, want nil", handler)
+	}
 }
 
 func serveRoutedRequest(t *testing.T, handler http.Handler, path string) string {
